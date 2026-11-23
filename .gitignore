@@ -1,0 +1,13 @@
+*.zip
+*.tar
+*.log
+*.pth
+__pycache__/
+Final_preprocessed_V3/
+FINAL_BRAIN_CT_RESEARCH/
+extracted_package/
+.ipynb_checkpoints/
+*.docx
+*.pdf
+cloudflared-linux-amd64
+research_ckpts.zip
