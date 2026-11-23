@@ -3,6 +3,7 @@
 # ==============================================================================
 import io
 import os
+import gc
 import time
 import hashlib
 from pathlib import Path
@@ -14,6 +15,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
+
+# Cap CPU threading to prevent memory spikes on Streamlit Cloud (1 GB RAM limit)
+torch.set_num_threads(1)
 
 # ── 1. Page Configuration ─────────────────────────────────────────────────────
 st.set_page_config(
@@ -111,8 +115,10 @@ def find_checkpoint(filename):
         zip_p = Path("research_ckpts.zip")
         if not zip_p.exists():
             gdown.download("https://drive.google.com/uc?id=12-37eHwQKlAMiv28MmsW5gfb5b-cGA-T", str(zip_p), quiet=True)
-        with zipfile.ZipFile(zip_p, "r") as zf:
-            zf.extractall(".")
+        if zip_p.exists():
+            with zipfile.ZipFile(zip_p, "r") as zf:
+                zf.extractall(".")
+            zip_p.unlink(missing_ok=True)  # Free disk/memory cache immediately
         for p in search_paths:
             if p.exists():
                 return str(p)
@@ -120,7 +126,7 @@ def find_checkpoint(filename):
         pass
     return None
 
-# ── 3. Grad-CAM++ Explainability Engine ───────────────────────────────────────
+# ── 3. Grad-CAM++ Explainability Engine (Memory-Protected) ─────────────────────
 class GradCAMpp:
     def __init__(self, model, target_layer):
         self.model = model
@@ -130,24 +136,38 @@ class GradCAMpp:
         target_layer.register_forward_hook(self._fwd_hook)
 
     def _fwd_hook(self, module, inp, out):
-        self.activations = out.clone()
+        self.activations = out
         if out.requires_grad:
-            out.register_hook(lambda grad: setattr(self, 'gradients', grad.clone()))
+            out.register_hook(lambda grad: setattr(self, 'gradients', grad))
 
     def generate(self, volume, class_idx, slice_idx):
-        self.model.zero_grad()
+        self.model.zero_grad(set_to_none=True)
         logits, _ = self.model(volume)
         score = logits[0, class_idx]
-        score.backward(retain_graph=True)
-        grads, acts = self.gradients, self.activations
-        g2, g3 = grads ** 2, grads ** 3
-        sum_acts = acts.sum(dim=(2, 3), keepdim=True)
-        alphas = g2 / (2 * g2 + sum_acts * g3 + 1e-7)
-        weights = (alphas * F.relu(grads)).sum(dim=(2, 3), keepdim=True)
-        cam = F.relu((weights * acts).sum(dim=1, keepdim=True))
-        slice_cam = cam[slice_idx, 0].detach().cpu().numpy()
-        slice_cam = cv2.resize(slice_cam, (224, 224))
-        c_min, c_max = slice_cam.min(), slice_cam.max()
+        score.backward() # Graph freed immediately upon completion
+
+        if self.gradients is None or self.activations is None:
+            return np.zeros((224, 224), dtype=np.float32)
+
+        with torch.no_grad():
+            grads = self.gradients.detach()
+            acts = self.activations.detach()
+            g2 = grads ** 2
+            g3 = grads ** 3
+            sum_acts = acts.sum(dim=(2, 3), keepdim=True)
+            alphas = g2 / (2 * g2 + sum_acts * g3 + 1e-7)
+            weights = (alphas * F.relu(grads)).sum(dim=(2, 3), keepdim=True)
+            cam = F.relu((weights * acts).sum(dim=1, keepdim=True))
+            slice_cam = cam[slice_idx, 0].cpu().numpy()
+            slice_cam = cv2.resize(slice_cam, (224, 224))
+            c_min, c_max = slice_cam.min(), slice_cam.max()
+
+        self.gradients = None
+        self.activations = None
+        del grads, acts, g2, g3, alphas, weights, cam
+        self.model.zero_grad(set_to_none=True)
+        gc.collect()
+
         return (slice_cam - c_min) / (c_max - c_min + 1e-8) if c_max > c_min else np.zeros_like(slice_cam)
 
 @st.cache_resource
@@ -165,6 +185,7 @@ def load_models_and_explainers():
         except TypeError:
             sd_a = torch.load(ckpt_a, map_location=device)
         m_a.load_state_dict(sd_a, strict=False)
+        del sd_a
         loaded_status.append(f"DenseNet-121 ({Path(ckpt_a).name})")
     if ckpt_b:
         try:
@@ -172,10 +193,12 @@ def load_models_and_explainers():
         except TypeError:
             sd_b = torch.load(ckpt_b, map_location=device)
         m_b.load_state_dict(sd_b, strict=False)
+        del sd_b
         loaded_status.append(f"VGG-16 ({Path(ckpt_b).name})")
         
     m_a.eval()
     m_b.eval()
+    gc.collect()
     
     gc_a = GradCAMpp(m_a, m_a.features.denseblock4)
     gc_b = GradCAMpp(m_b, m_b.features[40])
@@ -206,6 +229,7 @@ if uploaded_files and len(uploaded_files) > 0:
     for f in uploaded_files:
         img_pil = Image.open(f).convert('L').resize((224, 224))
         img_arr = np.array(img_pil)
+        img_pil.close()
         raw_images.append(img_arr)
         norm_img = (img_arr.astype(np.float32) / 255.0 - 0.485) / 0.229
         norm_slices.append(np.expand_dims(norm_img, axis=0))
@@ -312,5 +336,9 @@ CRYPTOGRAPHIC PROVENANCE (HYPERLEDGER FABRIC INTEGRITY LEDGER):
 """
     st.text_area("Generated Structured Report", diag_summary, height=260)
     st.download_button("📥 Download Clinical Diagnostic Report (.txt)", diag_summary, file_name=f"Report_{patient_id}.txt", mime="text/plain")
+    
+    # Explicit garbage collection to maintain minimal RAM footprint on Streamlit Cloud
+    del vol_tensor, raw_images, norm_slices, display_images, cam_a, cam_b, cam_ens
+    gc.collect()
 else:
     st.info("👆 Please upload 1 or more axial slice images (PNG/JPG) to execute dual-architecture inference.")
